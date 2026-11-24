@@ -1,0 +1,7 @@
+# Streamlit theme file - this is what gives drSaab its clean teal look.
+# Change the colors here and the whole app restyles itself.
+[theme]
+primaryColor = "#0d9488"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#eefaf8"
+textColor = "#1e293b"
