@@ -1,0 +1,784 @@
+"""
+drSaab - PART 4C: THE MEDICAL SCHOOL (learning from books & conversations)
+============================================================================
+This module is how drSaab "goes to medical school". It is pure Python with
+no Streamlit imports, so it can be tested standalone (scripts/test_medical_school.py).
+
+What it does, in the order a student would:
+  1. READ       extract text from PDFs / txt files (pypdf / pdfplumber)
+  2. HIGHLIGHT  find the medical entities in every sentence: symptoms,
+                conditions, tests, medicines - using the SAME canonical
+                vocabulary the rest of the app uses (passed in by app.py)
+  3. STUDY      count co-occurrences: which symptoms appear in sentences
+                about which condition, how often, how strongly
+  4. CONCLUDE   turn statistics into knowledge:
+                  - new conditions learned from scratch (full profiles)
+                  - extra symptoms / tests / medicines / red flags added to
+                    conditions the app already knows
+                  - confusions noted ("these two conditions share these signs")
+  5. REMEMBER   everything is saved to medical_school.json next to app.py
+                and re-loaded on every start
+
+The conclusions are honest statistics: a symptom is only linked to a
+condition if it shows up together often AND more often than chance
+(pointwise mutual information, the same idea spam filters use).
+"""
+
+import json
+import math
+import os
+import re
+from collections import Counter, defaultdict
+
+# --- 1) READING: pull text out of the study material ------------------------
+
+_PDF_PAGES_PROGRESS = 25          # log progress every N pages while studying
+
+
+def extract_text_from_file(path_or_bytes, filename=None):
+    """Return (text, n_pages, method) from a PDF or plain-text file.
+    Tries pypdf first, falls back to pdfplumber; .txt files are read directly."""
+    fname = str(filename or path_or_bytes)
+    lower = fname.lower()
+    if lower.endswith(".pdf") or (hasattr(path_or_bytes, "read") and not lower.endswith(".txt")):
+        data = _to_bytes(path_or_bytes)
+        text, n_pages, method = _extract_pdf_pypdf(data)
+        if not text.strip():
+            text, n_pages, method = _extract_pdf_pdfplumber(data)
+        return text, n_pages, method
+    data = _to_bytes(path_or_bytes)
+    return _decode_text(data), 1, "text"
+
+
+def _to_bytes(f):
+    if hasattr(f, "read"):
+        f.seek(0)
+        return f.read()
+    if isinstance(f, bytes):
+        return f
+    with open(f, "rb") as fh:
+        return fh.read()
+
+
+def _decode_text(data):
+    for enc in ("utf-8", "latin-1"):
+        try:
+            return data.decode(enc)
+        except UnicodeDecodeError:
+            continue
+    return data.decode("utf-8", errors="replace")
+
+
+def _extract_pdf_pypdf(data):
+    try:
+        from pypdf import PdfReader
+        import io
+        reader = PdfReader(io.BytesIO(data))
+        pages = []
+        for p in reader.pages:
+            try:
+                pages.append(p.extract_text() or "")
+            except Exception:
+                pages.append("")
+        return "\n".join(pages), len(pages), "pypdf"
+    except Exception:
+        return "", 0, "none"
+
+
+def _extract_pdf_pdfplumber(data):
+    try:
+        import io
+        import pdfplumber
+        with pdfplumber.open(io.BytesIO(data)) as pdf:
+            pages = [(page.extract_text() or "") for page in pdf.pages]
+        return "\n".join(pages), len(pages), "pdfplumber"
+    except Exception:
+        return "", 0, "none"
+
+
+# --- 2) HIGHLIGHTING: entity finding over the canonical vocabulary ----------
+
+def build_lexicon(diseases, symptoms, tests, aliases, diag_aliases):
+    """Everything the student is taught to recognise, in one lookup.
+    Returns {norm_phrase: (kind, canonical_name)} where kind is
+    symptom/condition/test. Longest phrase wins when scanning text."""
+    lex = {}
+
+    def put(phrase, kind, name):
+        key = _norm(phrase)
+        if len(key) >= 2 and (key not in lex or len(key) > len(lex[key][0])):
+            lex[key] = (kind, name)
+
+    for s in symptoms:
+        put(s, "symptom", s)
+    for name, d in diseases.items():
+        put(name, "condition", name)
+        for alias in d.get("aliases", []) or []:
+            put(alias, "condition", name)
+    for phrase, name in diag_aliases.items():
+        put(phrase, "condition", name)
+    for phrase, name in aliases.items():
+        put(phrase, "symptom", name)
+    for t in tests:
+        put(t, "test", t)
+    # short forms a book would use: "abdominal pain" for the canonical
+    # "Abdominal pain or cramps", "high fever" for "High fever (39°C ...)"
+    for s in symptoms:
+        for short in _short_forms(s):
+            put(short, "symptom", s)
+    return lex
+
+
+def _short_forms(canonical):
+    """'Abdominal pain or cramps' -> ['Abdominal pain']; 'High fever (39°C)'
+    -> ['High fever']; 'Body aches / muscle pain' -> both halves."""
+    out = []
+    if "(" in canonical:
+        head = canonical.split("(")[0].strip(" ,/")
+        if len(head) >= 4:
+            out.append(head)
+    if " or " in canonical.lower():
+        head = re.split(r"\s+or\s+", canonical, flags=re.I)[0].strip()
+        if len(head) >= 4:
+            out.append(head)
+    if "/" in canonical:
+        for half in canonical.split("/"):
+            h = half.strip()
+            if len(h) >= 4:
+                out.append(h)
+    return out
+
+
+def _norm(text):
+    t = str(text or "").lower()
+    t = t.replace("\u2019", "").replace("'", "")
+    t = re.sub(r"[^a-z0-9\u00b0\u00c0-\u024f]+", " ", t)
+    return " ".join(t.split())
+
+
+_SPLIT_RE = re.compile(r"(?<=[.!?:;])\s+(?=[A-Z0-9])|\n{2,}")
+
+
+def split_sentences(text):
+    """Split raw book text into sentences. Simple but works for textbook prose:
+    split on . ! ? : followed by a capital, and on blank lines."""
+    text = re.sub(r"-\n", "", text)            # de-hyphenate line breaks
+    text = re.sub(r"\s+", " ", text)
+    out = []
+    for chunk in _SPLIT_RE.split(text):
+        c = chunk.strip()
+        if len(c) >= 15:
+            out.append(c)
+    return out
+
+
+def find_entities(sentence, lexicon, extra_conditions=None):
+    """One sentence -> [(kind, canonical, start)]. Whole-phrase matching on
+    normalised text, longest first, no overlaps (same idea as app.py's
+    _find_phrase_spans). `extra_conditions` maps normalised names of
+    conditions the books taught but the KB doesn't know yet (Measles...)."""
+    norm = _norm(sentence)
+    merged = dict(lexicon)
+    for key, name in (extra_conditions or {}).items():
+        if key not in merged:
+            merged[key] = ("condition", name)
+    hits = []
+    for phrase in sorted(merged, key=len, reverse=True):
+        start = 0
+        while True:
+            i = norm.find(phrase, start)
+            if i == -1:
+                break
+            j = i + len(phrase)
+            boundary = (i == 0 or norm[i - 1] == " ") and (j >= len(norm) or norm[j] == " ")
+            if boundary and not any(i < e and s < j for s, e, _ in hits):
+                hits.append((i, j, merged[phrase]))
+            start = i + 1
+    return [(kind, name, s) for s, e, (kind, name) in sorted(hits)]
+
+
+# "Measles is a highly contagious viral infection" - definition patterns
+# that introduce a condition the lexicon does not know yet.
+_DEFINE_RE = re.compile(
+    r"(?i)([A-Z][a-z]{2,}(?:\s+[A-Za-z]{2,}){0,3}?)\s+"
+    r"(?:is|are|was|were)\s+(?:a|an|the|one)?\s*"
+    r"(?:acute\s+|chronic\s+|highly\s+|very\s+)*"
+    r"(contagious|infectious|viral|bacterial|fungal|parasitic|common|serious|"
+    r"recurrent|chronic) [a-z ]{3,30}?(infection|disease|disorder|illness|"
+    r"condition|syndrome|fever|headache)"
+)
+# "... of measles" / "signs of measles" / "diagnosed as measles"
+_OF_RE = re.compile(
+    r"(?i)(?:signs?|symptoms?|presentation|diagnosis|complications?|treatment|"
+    r"cause|causes|a case|cases|patients? (?:with|of))\s+of\s+"
+    r"([A-Z][A-Za-z]+(?:\s+[A-Za-z]{2,}){0,2})"
+)
+
+
+# trailing words that are never part of a condition name - stripped from
+# discovered candidates ("measles appear about" -> "measles")
+_NAME_STOPWORDS = {
+    "appear", "appears", "about", "is", "are", "was", "were", "that", "this",
+    "include", "includes", "can", "also", "requires", "require", "cause",
+    "causes", "caused", "occur", "occurs", "usually", "typically", "spread",
+    "spreads", "report", "reports", "patients", "patient", "people", "signs",
+    "symptoms", "cases", "case", "after", "before", "when", "while", "with",
+    "and", "or", "the", "a", "an", "of", "in", "on", "to", "for", "more",
+    "than", "them", "their", "his", "her", "its", "my", "your",
+    "doctors", "doctor", "physicians", "physician", "look", "looks",
+}
+
+
+def discover_conditions(text, known):
+    """Find condition names the lexicon doesn't know yet. Returns
+    {norm_name: Title Name} of candidates, e.g. {'measles': 'Measles'}.
+    `known` may hold canonical names ('Tuberculosis (TB)') - they are
+    normalised before comparison so partial names don't sneak past.
+    Captures carrying trailing words ('measles that doctors') are first
+    anchored: if they reduce to a KNOWN condition they are dropped, and if
+    not, only the clean leading span is kept."""
+    known_norm = {_norm(k) for k in known}
+    known_norm |= {k for k in known}
+    found = {}
+    for rx in (_DEFINE_RE, _OF_RE):
+        for m in rx.finditer(text):
+            cand = _clean_candidate(m.group(1))
+            if not cand:
+                continue
+            key = _norm(cand)
+            # anchor: 'measles that doctors' -> 'measles'
+            anchored = _anchor_condition(cand, known_norm)
+            if anchored is not None:
+                continue                  # trailing words around a KNOWN condition
+            # still strip generic trailing verbs for the label
+            if not key or key in known_norm or len(key) < 4 or len(key.split()) > 4:
+                continue
+            found[key] = cand
+    return found
+
+
+def _clean_candidate(raw):
+    """Strip trailing stopwords/verbs from a captured candidate name and
+    title-case it (condition names in the app are Title Case)."""
+    words = [w for w in str(raw or "").strip().split() if w]
+    while words and words[-1].lower().strip(".,:;") in _NAME_STOPWORDS:
+        words.pop()
+    out = " ".join(words).strip(" .,:;-")
+    if len(out) < 4:
+        return ""
+    return out[0].upper() + out[1:]
+
+
+# "Koplik spots inside the mouth are a specific sign of measles" -
+# a NEW symptom phrase the lexicon doesn't know, defined by the book itself.
+_SYMPTOM_DEFINE_RE = re.compile(
+    r"(?i)([A-Za-z][A-Za-z0-9 ()/-]{2,60}?)\s+(?:is|are)\s+(?:a|an|the)?\s*"
+    r"(?:specific|common|typical|classic|hallmark|characteristic|early|cardinal)\s+"
+    r"(?:sign|symptom|feature|finding|marker)s?\s+(?:of|for|in)\s+"
+    r"([a-z][A-Za-z]+(?:\s+[A-Za-z]{2,}){0,2})"
+)
+
+
+def discover_symptoms(text, known_symptoms_norm, conditions_norm):
+    """Unknown SYMPTOM phrases defined by the study material itself, e.g.
+    'Koplik spots inside the mouth are a specific sign of measles'.
+    Returns {norm_key: {'name': short Title label, 'full': phrase as written,
+    'conditions': {normalised condition: count}}}. Only phrases linked to a
+    condition we track are kept - that is what makes them symptoms and not
+    prose."""
+    out = {}
+    for m in _SYMPTOM_DEFINE_RE.finditer(text):
+        full = m.group(1).strip(" .,:;-()")
+        if not full or len(_norm(full)) < 4 or _norm(full) in known_symptoms_norm:
+            continue
+        # the condition capture can carry trailing words ('measles that
+        # doctors') - anchor it to the longest known-condition prefix
+        cond_key = _anchor_condition(m.group(2), conditions_norm)
+        if cond_key is None:
+            continue
+        # trim trailing modifiers for a clean option label:
+        # 'Koplik spots inside the mouth' -> 'Koplik spots'
+        short = re.split(r"\s+(?:inside|in|on|at|under|within|near|behind)\s+",
+                         full, flags=re.I)[0].strip(" .,:;-()")
+        short = re.sub(r"^(?:the|a|an)\s+", "", short, flags=re.I)
+        if len(_norm(short)) < 4:
+            short = full
+        label = short[0].upper() + short[1:]
+        entry = out.setdefault(_norm(short), {"name": label, "full": full,
+                                              "conditions": {}})
+        entry["conditions"][cond_key] = entry["conditions"].get(cond_key, 0) + 1
+    return out
+
+
+def _anchor_condition(raw, conditions_norm):
+    """Reduce a raw condition capture ('measles that doctors look for') to
+    the longest leading word-span that is a condition we track."""
+    words = [w for w in _norm(raw).split() if w]
+    for end in range(len(words), 0, -1):
+        cand = " ".join(words[:end])
+        if cand in conditions_norm:
+            return cand
+    return None
+
+
+# --- 3) STUDYING: the co-occurrence statistics -------------------------------
+
+class StudyCorpus:
+    """Everything the student has noticed while reading, as raw counts."""
+
+    def __init__(self):
+        self.sentences = 0
+        self.words = 0
+        self.sym_sent = Counter()               # symptom seen in a sentence
+        self.cond_sent = Counter()              # condition mentioned
+        self.cond_sym = defaultdict(Counter)    # condition -> symptom -> n
+        self.cond_test = defaultdict(Counter)   # condition -> test -> n
+        self.cond_cond = defaultdict(Counter)   # condition -> other condition -> n
+        self.test_sent = Counter()
+        self.sym_sym = defaultdict(Counter)
+
+    def study_text(self, text, lexicon, known=None, known_tests=None, known_symptoms=None):
+        """Read the text and count co-occurrences. Condition, test and SYMPTOM
+        phrases the lexicon doesn't know are discovered from definition
+        patterns ('Measles is a contagious viral infection', 'an IgM antibody
+        test for measles', 'Koplik spots are a specific sign of measles') and
+        learned as candidates."""
+        known = set(known if known is not None else lexicon_to_conditions(lexicon))
+        known_norm = {_norm(k) for k in known}
+        known_tests_norm = {t for t in (known_tests or {})} | \
+                           {_norm(k) for k, v in lexicon.items() if v[0] == "test"}
+        candidates = discover_conditions(text, known)
+        # condition names known OR discovered in this text are all valid
+        # anchors for new symptom phrases
+        anchor_norm = set(known_norm) | set(candidates.keys())
+        known_sym_norm = {_norm(s) for s in (known_symptoms or set())} | \
+                         {_norm(v[1]) for v in lexicon.values() if v[0] == "symptom"}
+        new_symptoms = discover_symptoms(text, known_sym_norm, anchor_norm)
+        new_tests = discover_tests(text, known_tests_norm, anchor_norm)
+        test_to_cond = {}
+        for tname, cond_key in new_tests.items():
+            for cname in list(known) + list(candidates.values()):
+                if _norm(cname) == cond_key:
+                    test_to_cond[tname] = cname
+                    break
+        for sent in split_sentences(text):
+            merged_lex = dict(lexicon)
+            for key, name in candidates.items():
+                merged_lex.setdefault(key, ("condition", name))
+            for tname in test_to_cond:
+                merged_lex.setdefault(_norm(tname), ("test", tname))
+            for nkey, entry in new_symptoms.items():
+                merged_lex.setdefault(nkey, ("symptom", entry["name"]))
+                # also match the phrase exactly as the book wrote it
+                merged_lex.setdefault(_norm(entry["full"]), ("symptom", entry["name"]))
+            ents = find_entities(sent, merged_lex)
+            if not ents:
+                continue
+            self.sentences += 1
+            self.words += len(sent.split())
+            syms = [n for k, n, _ in ents if k == "symptom"]
+            conds = [n for k, n, _ in ents if k == "condition"]
+            tests = [n for k, n, _ in ents if k == "test"]
+            for s in syms:
+                self.sym_sent[s] += 1
+            for c in conds:
+                self.cond_sent[c] += 1
+                for s in syms:
+                    self.cond_sym[c][s] += 1
+                for t in tests:
+                    self.cond_test[c][t] += 1
+            # 'X test for Y' sentences: link the test even if the sentence
+            # had no other entities
+            for tname, cname in test_to_cond.items():
+                if tname in tests:
+                    continue
+                if _norm(tname) and tname.lower() in _norm(sent):
+                    self.cond_test[cname][tname] += 1
+            for a in conds:
+                for b in conds:
+                    if a != b:
+                        self.cond_cond[a][b] += 1
+        return self
+
+    # -- statistics helpers --
+
+    def pmi(self, cond, sym):
+        """Pointwise mutual information: do 'condition' and 'symptom' show up
+        together MORE than independent chance would suggest? Positive means
+        a real association, not coincidence. Scaled to a 0..1 strength
+        (3 bits of surprise ~ certainty - realistic for one book)."""
+        n = max(1, self.sentences)
+        pc = self.cond_sent[cond] / n
+        ps = self.sym_sent[sym] / n
+        if pc <= 0 or ps <= 0:
+            return 0.0
+        pxy = self.cond_sym[cond][sym] / n
+        if pxy <= 0:
+            return 0.0
+        raw = math.log2(pxy / (pc * ps))
+        return max(0.0, min(1.0, raw / 3.0))
+
+
+# "an IgM antibody test for measles" - unknown TEST names, same idea as
+# conditions but for investigations the lexicon doesn't know yet.
+_TEST_DEFINE_RE = re.compile(
+    r"(?i)(?:an?\s+|the\s+)?((?:ig[mg]\s+)?[A-Za-z][A-Za-z0-9 ()/-]{2,45}?)\s+"
+    r"(?:test|assay|scan|culture|smear|biopsy|x ray|blood test)\s+"
+    r"(?:for|to confirm|confirms?)\s+([A-Za-z][A-Za-z]+(?:\s+[A-Za-z]{2,}){0,1})"
+)
+
+
+def discover_tests(text, known_tests_norm, known_conditions_norm):
+    """Unknown test names linked to a condition, from 'an IgM antibody test
+    for measles can confirm...'. Returns {Title Test: normalised condition}."""
+    out = {}
+    for m in _TEST_DEFINE_RE.finditer(text):
+        test = m.group(1).strip(" .,:;-()")
+        # strip leading fillers a regex can leave behind ('But an IgM antibody')
+        while test and test.split()[0].lower().strip(".,:;") in (
+                "but", "and", "or", "a", "an", "the", "with", "is", "are", "we",
+                "order", "ordered", "recommend", "recommended", "use", "used"):
+            test = " ".join(test.split()[1:])
+        cond = _clean_candidate(m.group(2))
+        if not test or len(_norm(test)) < 3:
+            continue
+        tkey = _norm(test + " test")
+        if tkey in known_tests_norm:
+            continue
+        # only trust the link if the condition is one we track (known or
+        # discovered in this text) - otherwise it is prose, not medicine
+        cond_key = _norm(cond)
+        if cond_key and len(cond_key) >= 4:
+            out[f"{test[0].upper()}{test[1:]} test"] = cond_key
+    return out
+
+
+def lexicon_to_conditions(lexicon):
+    """The set of canonical condition names already inside a lexicon."""
+    return {name for kind, name in lexicon.values() if kind == "condition"}
+
+
+# --- 4) CONCLUDING: statistics -> knowledge ----------------------------------
+
+def draw_conclusions(corpus, diseases, min_mentions=3, min_pmi=0.25):
+    """Turn the study counts into a 'conclusions' structure:
+      - new_conditions: full profiles for conditions not in the KB
+      - additions: extra symptoms (with weights) for known conditions
+      - tests: extra test suggestions per condition
+      - confusions: condition pairs that share many symptoms
+    Only statistically solid observations survive the thresholds. Known
+    conditions demand STRONGER evidence to be modified (the curated KB
+    deserves that respect); brand-new ones are learned from what the
+    material actually says, which in a real textbook chapter means each
+    sign is typically stated once."""
+    known = set(diseases)
+    conclusions = {
+        "new_conditions": {}, "additions": {}, "tests": {},
+        "confusions": [], "facts": [],
+    }
+
+    for cond, symc in corpus.cond_sym.items():
+        n_cond = corpus.cond_sent[cond]
+        if n_cond < min_mentions:
+            continue
+        is_new = cond not in known
+        for sym, n in symc.items():
+            strength = corpus.pmi(cond, sym)
+            if is_new:
+                # learning a NEW condition: the book chapter IS the evidence.
+                # PMI only RANKS the signs (shared ones like 'runny nose'
+                # score lower); every sign stated in the chapter is kept.
+                if n >= 1 and strength >= 0.02:
+                    conclusions["new_conditions"].setdefault(cond, {})[sym] = round(strength, 3)
+            else:
+                # augmenting the curated KB needs repetition
+                if n >= 2 and strength >= min_pmi:
+                    if sym not in (diseases[cond].get("symptoms") or {}):
+                        conclusions["additions"].setdefault(cond, {})[sym] = round(strength, 3)
+
+    for cond, tests in corpus.cond_test.items():
+        if corpus.cond_sent[cond] < min_mentions:
+            continue
+        for t, n in tests.items():
+            if n >= 2:
+                conclusions["tests"].setdefault(cond, {})[t] = n
+
+    # confusions: two conditions that co-mention strongly in the same sentences
+    for a, others in corpus.cond_cond.items():
+        if a not in known or corpus.cond_sent[a] < min_mentions:
+            continue
+        for b, n in others.items():
+            if b not in known or n < max(3, corpus.cond_sent[a] // 3):
+                continue
+            pair = tuple(sorted([a, b]))
+            if pair not in [(x["a"], x["b"]) for x in conclusions["confusions"]]:
+                shared = set(diseases[a]["symptoms"]) & set(diseases[b]["symptoms"])
+                conclusions["confusions"].append({
+                    "a": pair[0], "b": pair[1], "co_mentions": n,
+                    "shared_symptoms": sorted(shared)[:6],
+                })
+
+    conclusions["facts"] = _fact_sheet(corpus, diseases)
+    conclusions["facts_total"] = len(conclusions["facts"])
+    return conclusions
+
+
+def _fact_sheet(corpus, diseases):
+    """Plain-language facts the student can recite after reading:
+    'mentioned N times, strongest sign X' per condition."""
+    facts = []
+    for cond, n in corpus.cond_sent.most_common(40):
+        if n < 3:
+            continue
+        best = []
+        for sym, c in corpus.cond_sym[cond].most_common(8):
+            pmi = corpus.pmi(cond, sym)
+            if pmi >= 0.10 and c >= 1:
+                best.append((sym, pmi, c))
+        if not best:
+            continue
+        known = cond in diseases
+        facts.append({
+            "condition": cond, "mentions": n, "known": known,
+            "top_signs": [{"sign": s, "strength": round(p, 2), "times": c}
+                          for s, p, c in best[:5]],
+        })
+    return facts
+
+
+# --- 5) REMEMBERING: save / load the whole study state ------------------------
+
+SCHOOL_FILE = "medical_school.json"
+
+
+def school_path():
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), SCHOOL_FILE)
+
+
+def new_school():
+    return {
+        "version": 1,
+        "books": [],            # [{name, pages, sentences, words, studied_at}]
+        "corpus": _serialise_corpus(StudyCorpus()),
+        "conclusions": draw_conclusions(StudyCorpus(), {}),
+        "learned_profiles": {},   # new conditions -> full KB-style profile
+        "learned_symptoms": {},   # new symptom phrases -> {name, full, conditions}
+        "conversations": [],      # [{name, turns, symptoms, diagnosis, date}]
+    }
+
+
+def _serialise_corpus(c):
+    return {
+        "sentences": c.sentences, "words": c.words,
+        "sym_sent": dict(c.sym_sent), "cond_sent": dict(c.cond_sent),
+        "cond_sym": {k: dict(v) for k, v in c.cond_sym.items()},
+        "cond_test": {k: dict(v) for k, v in c.cond_test.items()},
+        "cond_cond": {k: dict(v) for k, v in c.cond_cond.items()},
+    }
+
+
+def _deserialise_corpus(d):
+    c = StudyCorpus()
+    c.sentences = int(d.get("sentences") or 0)
+    c.words = int(d.get("words") or 0)
+    c.sym_sent = Counter(d.get("sym_sent") or {})
+    c.cond_sent = Counter(d.get("cond_sent") or {})
+    c.cond_sym = defaultdict(Counter, {k: Counter(v) for k, v in (d.get("cond_sym") or {}).items()})
+    c.cond_test = defaultdict(Counter, {k: Counter(v) for k, v in (d.get("cond_test") or {}).items()})
+    c.cond_cond = defaultdict(Counter, {k: Counter(v) for k, v in (d.get("cond_cond") or {}).items()})
+    return c
+
+
+def load_school():
+    try:
+        with open(school_path(), "r", encoding="utf-8") as f:
+            data = json.load(f)
+        data.setdefault("books", [])
+        data.setdefault("conversations", [])
+        data.setdefault("learned_profiles", {})
+        data.setdefault("learned_symptoms", {})
+        return data
+    except Exception:
+        return None
+
+
+def save_school(school):
+    with open(school_path(), "w", encoding="utf-8") as f:
+        json.dump(school, f, ensure_ascii=False, indent=1)
+
+
+# --- 6) THE FULL "STUDY SESSION" ----------------------------------------------
+
+def study_document(school, data, filename, lexicon, diseases):
+    """One book/PDF through the full pipeline. Adds to the corpus, redraws
+    conclusions, builds profiles for new conditions. Returns a report dict."""
+    text, n_pages, method = extract_text_from_file(data, filename)
+    if not text.strip():
+        return {"ok": False, "error": f"Could not read any text from {filename} "
+                                      f"({method} extraction failed - is it a scanned PDF?)"}
+    corpus = _deserialise_corpus(school["corpus"])
+    before_sent = corpus.sentences
+    corpus.study_text(text, lexicon, known_symptoms=school.get("learned_symptoms", {}).keys())
+    school["corpus"] = _serialise_corpus(corpus)
+
+    book_entry = {
+        "name": os.path.basename(str(filename)), "pages": n_pages,
+        "sentences": corpus.sentences - before_sent,
+        "words": len(text.split()), "method": method,
+    }
+    if book_entry not in school["books"]:
+        school["books"].append(book_entry)
+
+    conclusions = draw_conclusions(corpus, diseases)
+    school["conclusions"] = conclusions
+    school["learned_profiles"] = _build_learned_profiles(
+        conclusions, corpus, school.get("learned_profiles", {}))
+    # NEW symptom phrases the book defined (e.g. 'Koplik spots'): remember
+    # them so they appear in the picker and the chat vocabulary forever
+    known_syms_norm = {_norm(v[1]) for v in lexicon.values() if v[0] == "symptom"} | \
+                      {_norm(k) for k in school.get("learned_symptoms", {})}
+    anchor_norm = {_norm(d) for d in diseases} | \
+                  {_norm(k) for k in school.get("learned_profiles", {})}
+    fresh = discover_symptoms(text, known_syms_norm, anchor_norm)
+    learned_syms = school.setdefault("learned_symptoms", {})
+    for key, entry in fresh.items():
+        if key not in learned_syms:
+            learned_syms[key] = {"name": entry["name"], "full": entry["full"],
+                                 "conditions": entry["conditions"],
+                                 "from_book": os.path.basename(str(filename))}
+    save_school(school)
+    return {
+        "ok": True, "pages": n_pages, "method": method,
+        "sentences": book_entry["sentences"], "words": book_entry["words"],
+        "new_conditions": list(conclusions["new_conditions"].keys()),
+        "additions": {k: list(v) for k, v in conclusions["additions"].items()},
+        "new_symptoms": [v["name"] for v in fresh.values()],
+        "facts_total": conclusions["facts_total"],
+    }
+
+
+def _build_learned_profiles(conclusions, corpus, existing):
+    """Full KB-style profiles for conditions the books taught that the
+    built-in knowledge base does not have (e.g. Measles)."""
+    profiles = dict(existing)
+    for cond, syms in conclusions["new_conditions"].items():
+        if cond in profiles:
+            continue
+        ranked = sorted(syms.items(), key=lambda kv: -kv[1])[:10]
+        weights = {}
+        for i, (s, strength) in enumerate(ranked):
+            weights[s] = 3 if strength >= 0.6 and i < 3 else (2 if strength >= 0.4 else 1)
+        mentions = corpus.cond_sent[cond]
+        profiles[cond] = {
+            "name": cond,
+            "about": f"Learned from {mentions} mentions in the study material (books and "
+                     f"conversations). The strongest associated signs are listed below.",
+            "symptoms": weights,
+            "urgency": "see-doctor",
+            "duration": "varies (see a doctor for confirmation)",
+            "medicines": [],
+            "home_care": ["Follow the advice of the doctor who treats you",
+                          "Rest, hydrate, and track your symptoms"],
+            "red_flags": ["Symptoms worsen quickly or new severe symptoms appear",
+                          "You cannot eat, drink or stay awake normally"],
+            "typical_tests": [],
+            "learned": True,
+            "mentions": mentions,
+        }
+    return profiles
+
+
+# --- 7) LEARNING FROM DOCTOR-PATIENT CONVERSATIONS ---------------------------
+
+# markers commonly used in transcripts (Doctor:/Patient:/D: /P: ...)
+_TURN_RE = re.compile(
+    r"(?im)^\s*(?:\[(?:doctor|physician|dr)\]|(?:doctor|physician|dr)\.?|d)\s*[:\-]\s*(.+?)"
+    r"(?=\n\s*(?:\[?(?:doctor|physician|dr|patient|pt|d|p)\]?\.?\s*[:\-])|\Z)"
+)
+_PATIENT_RE = re.compile(
+    r"(?im)^\s*(?:\[(?:patient|pt)\]|(?:patient|pt))\.?\s*[:\-]\s*(.+?)"
+    r"(?=\n\s*(?:\[?(?:doctor|physician|dr|patient|pt|d|p)\]?\.?\s*[:\-])|\Z)"
+)
+
+
+def parse_conversation(text):
+    """Split a transcript into doctor turns and patient turns. Returns
+    (doctor_turns, patient_turns, n_turns_total)."""
+    doctor = [m.group(1).strip() for m in _TURN_RE.finditer(text) if m.group(1).strip()]
+    patient = [m.group(1).strip() for m in _PATIENT_RE.finditer(text) if m.group(1).strip()]
+    return doctor, patient, len(doctor) + len(patient)
+
+
+def learn_from_conversation(school, text, name, lexicon, diseases, normalizers):
+    """Study one doctor-patient transcript:
+      - the WHOLE conversation joins the book corpus (symptom-condition stats)
+      - if a diagnosis is clearly stated, a synthetic patient record is
+        created from the patient's complaints (feeds the ML model too)
+    normalizers: dict with 'symptom' and 'diagnosis' callables from app.py."""
+    doctor, patient, n_turns = parse_conversation(text)
+    if n_turns == 0:
+        # no markers - treat the whole text as one flowing narrative
+        doctor, patient, n_turns = [], [text.strip()], 1
+
+    corpus = _deserialise_corpus(school["corpus"])
+    corpus.study_text(text, lexicon)          # conversations count as reading too
+
+    # find a stated diagnosis in the doctor's turns
+    diag_norm = normalizers["diagnosis"]
+    known_conditions = set(diseases) | set(school.get("learned_profiles") or {})
+    diagnosis = None
+    diag_res = [
+        # "my diagnosis is measles" / "you have typhoid fever"
+        r"(?i)(?:diagnos\w*|impression|conclusion)\s+(?:is|was|:|-)?\s*"
+        r"([a-z][a-z \-]{2,40})",
+        r"(?i)(?:you (?:have|are suffering from)|suffering from|it (?:sounds|seems) like|"
+        r"i (?:conclude|think you have)|my diagnosis is|suggests?|consistent with)\s+([a-z][a-z \-]{2,40})",
+    ]
+    for turn in doctor:
+        if diagnosis:
+            break
+        for rx in diag_res:
+            for m in re.finditer(rx, turn):
+                cand = diag_norm(m.group(1).strip(" .,"))
+                if cand and (cand in known_conditions
+                             or cand in {v.get("name", k) for k, v in school.get("learned_profiles", {}).items()}):
+                    diagnosis = cand
+                    break
+            if diagnosis:
+                break
+
+    # pull symptoms from everything the patient said (+ doctor's questions)
+    sym_norm = normalizers["symptom"]
+    symptoms = []
+    for turn in patient + doctor:
+        for kind, name, _ in find_entities(turn, lexicon):
+            if kind == "symptom" and name not in symptoms:
+                symptoms.append(name)
+
+    record = None
+    if diagnosis and symptoms:
+        record = {
+            "id": f"CHAT-{len(school['conversations']) + 1:04d}",
+            "age": None, "gender": None, "city": "", "month": None,
+            "symptoms": symptoms, "diagnosis": diagnosis,
+            "tests_done": [], "test_results": "",
+            "medicines": [], "outcome": "learned from conversation",
+            "source": "conversation",
+        }
+        school["conversations"].append({
+            "name": os.path.basename(str(name or "conversation")),
+            "turns": n_turns, "diagnosis": diagnosis,
+            "symptoms": symptoms, "record_id": record["id"],
+        })
+
+    conclusions = draw_conclusions(corpus, diseases)
+    school["conclusions"] = conclusions
+    school["corpus"] = _serialise_corpus(corpus)
+    school["learned_profiles"] = _build_learned_profiles(
+        conclusions, corpus, school.get("learned_profiles", {}))
+    save_school(school)
+    return {
+        "ok": True, "turns": n_turns, "diagnosis": diagnosis,
+        "symptoms": symptoms, "record": record,
+        "new_conditions": list(conclusions["new_conditions"].keys()),
+    }
