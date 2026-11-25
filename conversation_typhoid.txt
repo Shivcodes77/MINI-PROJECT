@@ -1,0 +1,9 @@
+Clinic transcript - evening OPD
+Patient: Doctor saab, mere ko 8 din se bukhar hai aur pet dard bhi hai. (Doctor, I have had fever for 8 days and abdominal pain too.)
+Doctor: Any other complaints? How is your appetite?
+Patient: Appetite is very low and I feel very weak.
+Doctor: Any bowel problems?
+Patient: Some constipation since three days.
+Doctor: I will order a blood culture and a Widal test. The fever with abdominal pain, loss of appetite and constipation suggests typhoid fever.
+Doctor: The Widal test came back positive. My diagnosis is typhoid fever. I am prescribing azithromycin.
+Patient: Dhanyavaad doctor.
